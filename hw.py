@@ -1,13 +1,11 @@
 import logging
+import sqlite3, asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
-from sqlalchemy import create_engine, Column, Integer, String, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 
 logging.basicConfig(level=logging.INFO)
 
@@ -16,29 +14,24 @@ bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-DATABASE_URL = "sqlite:///hotels.db"
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-Base = declarative_base()
+DATABASE_URL = "hotels.db"
 
 
-class Hotel(Base):
-    __tablename__ = "hotels"
+# Инициализация базы данных
+def init_db():
+    with sqlite3.connect(DATABASE_URL) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE,
+                referrer_id INTEGER
+            )
+        """)
+        conn.commit()
 
-    id = Column(Integer, primary_key=True, index=True)
-    region = Column(String, index=True)
-    city = Column(String, index=True)
-    accommodation_type = Column(String)
-    rooms_count = Column(Integer)
-    amenities = Column(Text)
-    distance_beach = Column(String)
-    price_range = Column(String)
-    photo_ids = Column(Text)
-    photo_descriptions = Column(Text)
 
-
-Base.metadata.create_all(bind=engine)
+init_db()
 
 
 class Registration(StatesGroup):
@@ -59,11 +52,20 @@ class BusinessRegistration(StatesGroup):
 
 @dp.message_handler(commands=['start', 'help'])
 async def send_welcome(message: types.Message):
+    with sqlite3.connect(DATABASE_URL) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE user_id=?", (message.from_user.id,))
+        user = cursor.fetchone()
+        if not user:
+            cursor.execute("INSERT INTO users (user_id) VALUES (?)", (message.from_user.id,))
+            conn.commit()
+            user = cursor.lastrowid
+
     start_markup = InlineKeyboardMarkup().add(
         InlineKeyboardButton("Бизнес аккаунт", callback_data="business"),
         InlineKeyboardButton("Пример заполнения", callback_data="example")
-    )
-    await message.answer("Привет! Выберите тип аккаунта для регистрации.", reply_markup=start_markup)
+    ).add(InlineKeyboardButton("Назад", callback_data="back"))
+    await message.answer(f"Привет! Ваша реферальная ссылка: t.me/YourBot?start={user}", reply_markup=start_markup)
     await Registration.ACCOUNT_TYPE.set()
 
 
@@ -85,7 +87,7 @@ async def show_example(callback_query: types.CallbackQuery):
         InlineKeyboardButton("Бишкек", callback_data="region_bishkek"),
         InlineKeyboardButton("Ош", callback_data="region_osh")
         # Добавьте больше кнопок для других регионов
-    )
+    ).add(InlineKeyboardButton("Назад", callback_data="back"))
     await bot.send_message(callback_query.from_user.id, "Выберите регион:", reply_markup=regions_markup)
     await BusinessRegistration.REGION.set()
 
@@ -99,22 +101,25 @@ async def choose_region(callback_query: types.CallbackQuery, state: FSMContext):
         InlineKeyboardButton("Город 1", callback_data="city_1"),
         InlineKeyboardButton("Город 2", callback_data="city_2")
         # Добавьте больше кнопок для других городов
-    )
+    ).add(InlineKeyboardButton("Назад", callback_data="back"))
     await bot.send_message(callback_query.from_user.id, "Выберите город:", reply_markup=cities_markup)
     await BusinessRegistration.CITY.set()
 
 
 @dp.callback_query_handler(state=BusinessRegistration.CITY)
 async def choose_city(callback_query: types.CallbackQuery, state: FSMContext):
+    print(callback_query.data)  # Добавляем вывод для отладки
     city = callback_query.data.split('_')[1]
     await state.update_data(city=city)
 
     await bot.send_message(callback_query.from_user.id, "Теперь выберите тип размещения.")
 
+
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("Гостиница", callback_data="Гостиница"))
     markup.add(InlineKeyboardButton("Гостевой дом", callback_data="Гостевой дом"))
     markup.add(InlineKeyboardButton("Пансионат", callback_data="Пансионат"))
+    markup.add(InlineKeyboardButton("Назад", callback_data="back"))
     await bot.send_message(callback_query.from_user.id, "Теперь выберите тип размещения:", reply_markup=markup)
     await BusinessRegistration.ACCOMMODATION_TYPE.set()
 
@@ -145,11 +150,11 @@ async def choose_rooms_count(message: types.Message, state: FSMContext):
 async def add_amenities_nutrition(callback_query: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     amenities = data.get('amenities', [])
-    amenity = callback_query.data.split('_')[1]
+    amenity = callback_query.data
     if amenity not in amenities:
-                amenities.append(amenity)
-                await state.update_data(amenities=amenities)
-                await callback_query.answer(f"Удобство '{amenity}' добавлено.", show_alert=False)
+        amenities.append(amenity)
+        await state.update_data(amenities=amenities)
+        await callback_query.answer(f"Удобство '{amenity}' добавлено.", show_alert=False)
 
     if len(amenities) >= 3:  # Ожидаем как минимум 3 удобства
         await BusinessRegistration.DISTANCE_BEACH.set()
@@ -207,38 +212,62 @@ async def add_photo_description(message: types.Message, state: FSMContext):
 
 async def finish_registration(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
+
+    with sqlite3.connect(DATABASE_URL) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO hotels (region, city, accommodation_type, rooms_count, amenities, distance_beach, price_range, photo_ids, photo_descriptions)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_data['region'],
+            user_data['city'],
+            user_data['accommodation_type'],
+            user_data['rooms_count'],
+            ','.join(user_data['amenities']),
+            user_data['distance_beach'],
+            user_data['price_range'],
+            ','.join(user_data['photos']),
+            ','.join(user_data['photo_descriptions'])
+        ))
+        conn.commit()
+
     await state.finish()
     await message.answer("Спасибо за предоставление информации. Ваш отель успешно зарегистрирован.")
 
 
 @dp.message_handler(commands=['profile'])
-async def view_profile(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    if user_data:
-        region_city = f"{user_data.get('region')}, {user_data.get('city')}"
-        accommodation_type = user_data.get('accommodation_type')
-        rooms_count = user_data.get('rooms_count')
-        amenities = ", ".join(user_data.get('amenities', []))
-        distance_beach = user_data.get('distance_beach')
-        price_range = user_data.get('price_range')
-        photos = user_data.get('photos', [])
-        descriptions = user_data.get('photo_descriptions', [])
+async def view_profile(message: types.Message):
+    with sqlite3.connect(DATABASE_URL) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM hotels")
+        hotels = cursor.fetchall()
 
-        profile_message = (
-            f"Регион и город: {region_city}\n"
-            f"Тип размещения: {accommodation_type}\n"
-            f"Количество мест: {rooms_count}\n"
-            f"Удобства: {amenities}\n"
-            f"Расстояние до пляжа: {distance_beach}\n"
-            f"Ценовой диапазон: {price_range}\n"
-            f"Фотографии и описания:\n"
-        )
+        if hotels:
+            for hotel in hotels:
+                region_city = f"{hotel[1]}, {hotel[2]}"
+                accommodation_type = hotel[3]
+                rooms_count = hotel[4]
+                amenities = hotel[5]
+                distance_beach = hotel[6]
+                price_range = hotel[7]
+                photos = hotel[8].split(',')
+                descriptions = hotel[9].split(',')
 
-        await message.answer(profile_message)
-        for photo, description in zip(photos, descriptions):
-            await bot.send_photo(message.chat.id, photo, caption=description)
-    else:
-        await message.answer("Ваш профиль пока пуст.")
+                profile_message = (
+                    f"Регион и город: {region_city}\n"
+                    f"Тип размещения: {accommodation_type}\n"
+                    f"Количество мест: {rooms_count}\n"
+                    f"Удобства: {amenities}\n"
+                    f"Расстояние до пляжа: {distance_beach}\n"
+                    f"Ценовой диапазон: {price_range}\n"
+                    f"Фотографии и описания:\n"
+                )
+
+                await message.answer(profile_message)
+                for photo, description in zip(photos, descriptions):
+                    await bot.send_photo(message.chat.id, photo, caption=description)
+        else:
+            await message.answer("Ваш профиль пока пуст.")
 
 
 @dp.message_handler(commands=['add_hotel'])
@@ -279,8 +308,14 @@ async def view_all_updates_command(message: types.Message):
 async def manage_updates_command(message: types.Message):
     await manage_updates(message, dp.current_state())
 
+@dp.callback_query_handler(text="back")
+async def go_back(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.message.edit_text("Вы вернулись назад.")
+
+
+async def main():
+    await dp.start_polling()
+
 
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
-
-       
+    asyncio.run(main())
